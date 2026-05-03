@@ -1,0 +1,87 @@
+name: unmergable
+
+on:
+  schedule:
+    - cron: '3 0 * * *' # Runs daily at midnight
+  workflow_dispatch: # Allows manual triggering
+
+jobs:
+  check-unmergeable:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query PRs
+        id: query
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Use a variable if defined, otherwise default to the repo owner
+          USERNAME: ${{ vars.UNMERGEABLE_USERNAME || github.repository_owner }}
+        run: |
+          QUERY='query($login: String!) {
+            user(login: $login) {
+              pullRequests(last: 100, states: OPEN) {
+                edges {
+                  node {
+                    number
+                    url
+                    baseRefName
+                    headRefName
+                    mergeable
+                    isDraft
+                  }
+                }
+              }
+            }
+          }'
+
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RAW_RESULT=$(gh api graphql -f query="$QUERY" -f login="$USERNAME")
+            
+            # Check if any PRs have UNKNOWN status
+            UNKNOWN_COUNT=$(echo "$RAW_RESULT" | jq '[.data.user.pullRequests.edges[] | select(.node.mergeable == "UNKNOWN")] | length')
+            
+            if [ "$UNKNOWN_COUNT" -gt 0 ]; then
+              echo "Found $UNKNOWN_COUNT PRs with UNKNOWN mergeable status. Retrying in 30 seconds... (Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
+              sleep 30
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+            else
+              break
+            fi
+          done
+
+          # Filter for non-MERGEABLE PRs (this includes CONFLICTING, UNKNOWN if still present, etc.)
+          RESULT=$(echo "$RAW_RESULT" | jq '.data.user.pullRequests.edges[] | select(.node.mergeable != "MERGEABLE")')
+
+          if [ -n "$RESULT" ]; then
+            echo "found=true" >> $GITHUB_OUTPUT
+            # Prepare the email body
+            {
+              echo "body<<EOF"
+              echo "The following unmergeable PRs were found for $USERNAME:"
+              echo ""
+              echo "$RESULT" | jq .
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            
+            # Also save to file for attachment
+            echo "$RESULT" | jq . > unmergeable_report.json
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "No unmergeable PRs found."
+          fi
+
+      - name: Send mail
+        if: steps.query.outputs.found == 'true'
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: ${{secrets.MAIL_SERVER}}
+          server_port: 587
+          username: ${{secrets.MAIL_USERNAME}}
+          password: ${{secrets.MAIL_PASSWORD}}
+          subject: "Unmergeable PRs Report - ${{ github.repository }}"
+          to: ${{ secrets.MAIL_TO }}
+          from: "GitHub Actions <${{ secrets.MAIL_FROM }}>"
+          body: ${{ steps.query.outputs.body }}
+          attachments: unmergeable_report.json
